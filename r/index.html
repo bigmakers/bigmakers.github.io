@@ -58,6 +58,50 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   [hidden] { display: none !important; }
+  .actions {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 14px 16px;
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1.3;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    color: var(--ink);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active { background: var(--bg); }
+  #saveImageBtn { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .fallback {
+    margin: -2px 0 0;
+    font-size: 13px;
+    color: var(--warn);
+    line-height: 1.6;
+    text-align: center;
+  }
+  .hint {
+    margin: -2px 0 0;
+    font-size: 12px;
+    color: var(--sub);
+    line-height: 1.6;
+    text-align: center;
+  }
+  @media print {
+    body { margin: 0; padding: 0; background: #fff; }
+    main { max-width: none; margin: 0; }
+    h1, .actions, .note, .meta, #loading, #error { display: none !important; }
+    .card { border: none; border-radius: 0; padding: 0; }
+    .card img { width: 100%; height: auto; }
+    @page { size: A4 landscape; margin: 0; }
+  }
 </style>
 </head>
 <body>
@@ -72,6 +116,12 @@
   <div id="viewer" hidden>
     <div class="card">
       <img id="receipt" alt="領収書">
+    </div>
+    <div class="actions" id="actions">
+      <button type="button" id="saveImageBtn" class="btn">画像を保存</button>
+      <p class="fallback" id="saveImageFallback" hidden>保存できない場合は画像を長押しして「"写真"に追加」を選んでください</p>
+      <button type="button" id="savePdfBtn" class="btn">PDFで保存</button>
+      <p class="hint">プリント画面から"PDFとして保存"できます</p>
     </div>
     <p class="note">画像を長押しして「写真に追加」で保存してください。</p>
     <p class="meta" id="expiry"></p>
@@ -105,11 +155,43 @@
     el("error").hidden = false;
   }
 
+  function saveImage() {
+    const url = el("receipt").src;
+    const id = recordId() || "unknown";
+    el("saveImageFallback").hidden = true;
+    fetch(url)
+      .then((res) => {
+        if (!res.ok) throw new Error("fetch failed: " + res.status);
+        return res.blob();
+      })
+      .then((blob) => {
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = "領収書_No." + id + ".png";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+      })
+      .catch((error) => {
+        // CloudKitのアセットURL(cvws.icloud-content.com等)はCORSで読めないことがある。
+        console.error(error);
+        el("saveImageFallback").hidden = false;
+      });
+  }
+
+  function savePdf() {
+    window.print();
+  }
+
   function showImage(url, expiresAt) {
     const img = el("receipt");
     img.onload = () => {
       el("loading").hidden = true;
       el("viewer").hidden = false;
+      el("saveImageBtn").addEventListener("click", saveImage);
+      el("savePdfBtn").addEventListener("click", savePdf);
     };
     img.onerror = () => showError(
       "画像を読み込めませんでした",
