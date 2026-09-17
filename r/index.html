@@ -175,7 +175,16 @@
   /**
    * URLフラグメント(#より後ろ、"1."/"0."前置込み)を領収書データのオブジェクトに戻す。
    * 壊れている・非対応の場合は null を返さず例外を投げて呼び出し側で文言を出し分ける。
+   *
+   * v8-9: フラグメントは客のURL由来で改変できる。展開後サイズが異常に大きいものは
+   * JSON.parse に通す前に弾く(巨大な文字列のパース自体を避ける)。
    */
+  const PAYLOAD_LIMITS = {
+    maxDecodedBytes: 64 * 1024,
+    maxItems: 50,
+    maxStringLength: 200
+  };
+
   async function decodeFragment(fragment) {
     if (!fragment || fragment.length < 3) return null;
     const prefix = fragment.slice(0, 2);
@@ -190,36 +199,106 @@
     } else {
       jsonBytes = raw;
     }
+    if (jsonBytes.length > PAYLOAD_LIMITS.maxDecodedBytes) {
+      throw new PayloadValidationError("too-large");
+    }
     const text = new TextDecoder("utf-8").decode(jsonBytes);
     return JSON.parse(text);
   }
 
-  /** 復元したJSONの最低限の形を整える(壊れたデータで描画が落ちないように)。*/
+  /** 型不一致・上限超過・辻褄不一致など、`normalizePayload` が構造を信用できないと判断した理由。 */
+  class PayloadValidationError extends Error {
+    constructor(reason) {
+      super(`invalid receipt payload: ${reason}`);
+      this.reason = reason;
+    }
+  }
+
+  function isFiniteInteger(v) {
+    return typeof v === "number" && Number.isFinite(v) && Number.isInteger(v);
+  }
+
+  function isNonNegativeInteger(v) {
+    return isFiniteInteger(v) && v >= 0;
+  }
+
+  function isPlainObject(v) {
+    return !!v && typeof v === "object" && !Array.isArray(v);
+  }
+
+  function requireString(v, allowEmpty) {
+    if (typeof v !== "string") throw new PayloadValidationError("type-mismatch");
+    if (v.length > PAYLOAD_LIMITS.maxStringLength) throw new PayloadValidationError("too-large");
+    if (!allowEmpty && !v) throw new PayloadValidationError("type-mismatch");
+    return v;
+  }
+
+  /** 型不一致・任意欄が欠けている場合の既定値付き文字列(無ければ空文字)。 */
+  function optionalString(v) {
+    if (v === undefined || v === null) return "";
+    return requireString(v, true);
+  }
+
+  /**
+   * 復元したJSONを検証込みで整形する。フラグメントは客のURL由来で改変可能なので、
+   * 型・件数・文字列長・数値の非負整数性・**明細金額の合計と総額の一致**まで確認し、
+   * 一つでも崩れていれば `PayloadValidationError` を投げて呼び出し側でエラー表示に落とす
+   * (以前は型不一致があると `row[0]` 等へのアクセスで例外を投げっぱなしにし、
+   * 「読み込んでいます…」のまま止まっていた)。
+   */
   function normalizePayload(raw) {
-    if (!raw || typeof raw !== "object") return null;
-    if (typeof raw.n !== "string" || !raw.n) return null;
-    if (typeof raw.t !== "number") return null;
-    if (!Array.isArray(raw.i) || raw.i.length === 0) return null;
-    const issuer = raw.is && typeof raw.is === "object" ? raw.is : {};
+    if (!isPlainObject(raw)) throw new PayloadValidationError("type-mismatch");
+
+    const no = requireString(raw.n, false);
+    if (!isNonNegativeInteger(raw.t)) throw new PayloadValidationError("type-mismatch");
+    if (!Array.isArray(raw.i) || raw.i.length === 0) throw new PayloadValidationError("type-mismatch");
+    if (raw.i.length > PAYLOAD_LIMITS.maxItems) throw new PayloadValidationError("too-large");
+
+    const items = raw.i.map((row) => {
+      if (!Array.isArray(row) || row.length < 3) throw new PayloadValidationError("type-mismatch");
+      const name = requireString(row[0], true);
+      const amount = row[1];
+      const qty = row[2];
+      const taxRate = row.length > 3 ? row[3] : null;
+      if (!isNonNegativeInteger(amount)) throw new PayloadValidationError("type-mismatch");
+      if (!isNonNegativeInteger(qty)) throw new PayloadValidationError("type-mismatch");
+      if (taxRate !== null && !isFiniteInteger(taxRate)) throw new PayloadValidationError("type-mismatch");
+      return { name, amount, qty, taxRate };
+    });
+
+    // v8-9: 明細金額の合計と総額が一致しない=改ざん・破損とみなす
+    const itemsSum = items.reduce((sum, it) => sum + it.amount, 0);
+    if (itemsSum !== raw.t) throw new PayloadValidationError("sum-mismatch");
+
+    let tax = [];
+    if (raw.x !== undefined) {
+      if (!Array.isArray(raw.x)) throw new PayloadValidationError("type-mismatch");
+      if (raw.x.length > PAYLOAD_LIMITS.maxItems) throw new PayloadValidationError("too-large");
+      tax = raw.x.map((row) => {
+        if (!Array.isArray(row) || row.length < 3) throw new PayloadValidationError("type-mismatch");
+        const [rate, target, taxAmount] = row;
+        if (!isNonNegativeInteger(rate) || !isNonNegativeInteger(target) || !isNonNegativeInteger(taxAmount)) {
+          throw new PayloadValidationError("type-mismatch");
+        }
+        return { rate, target, tax: taxAmount };
+      });
+    }
+
+    if (raw.is !== undefined && !isPlainObject(raw.is)) throw new PayloadValidationError("type-mismatch");
+    const issuer = raw.is || {};
+
     return {
-      no: raw.n,
-      dateRaw: typeof raw.d === "string" ? raw.d : "",
-      payee: typeof raw.p === "string" ? raw.p : "",
+      no,
+      dateRaw: optionalString(raw.d),
+      payee: optionalString(raw.p),
       total: raw.t,
-      items: raw.i.map((row) => ({
-        name: String(row[0] ?? ""),
-        amount: Number(row[1]) || 0,
-        qty: Number(row[2]) || 0,
-        taxRate: row[3] == null ? null : Number(row[3])
-      })),
-      tax: Array.isArray(raw.x)
-        ? raw.x.map((row) => ({ rate: Number(row[0]), target: Number(row[1]), tax: Number(row[2]) }))
-        : [],
+      items,
+      tax,
       issuer: {
-        name: typeof issuer.n === "string" ? issuer.n : "",
-        address: typeof issuer.a === "string" ? issuer.a : "",
-        personName: typeof issuer.p === "string" ? issuer.p : "",
-        registrationNumber: typeof issuer.r === "string" ? issuer.r : ""
+        name: optionalString(issuer.n),
+        address: optionalString(issuer.a),
+        personName: optionalString(issuer.p),
+        registrationNumber: optionalString(issuer.r)
       }
     };
   }
@@ -407,6 +486,102 @@
     return Math.max(textH, 58);
   }
 
+  // ------------------------------------------------------------
+  // 明細ブロック(但し書き〜税額行)のモデル化。
+  // 発行者ブロック(footer)を先に確保したあとの残り空間に収まるよう、
+  // 「行間を詰める→明細を畳む→フォントを縮小(下限9pt)」の順で段階的に圧縮する。
+  // ReceiptImageView.swift の compressionStages と同じ考え方。
+  // ------------------------------------------------------------
+
+  /** 6件以上あるときは先頭(limit-1)件 + 「ほか n点 ¥x」にまとめる(Sale.swift の detailLines と同じ丸め方)。 */
+  function collapseItems(items, limit) {
+    if (items.length <= limit) {
+      return items.map((it) => ({ name: itemLineLabel(it), amount: it.amount }));
+    }
+    const head = items.slice(0, Math.max(1, limit - 1));
+    const rest = items.slice(head.length);
+    const restQty = rest.reduce((s, it) => s + it.qty, 0);
+    const restAmount = rest.reduce((s, it) => s + it.amount, 0);
+    return head
+      .map((it) => ({ name: itemLineLabel(it), amount: it.amount }))
+      .concat([{ name: `ほか ${restQty}点`, amount: restAmount }]);
+  }
+
+  /** 但し書き〜税額行の行モデルを組み立てる(実際の描画はせず、高さ計算にも使う)。 */
+  function buildProvisoModel(doc, isMulti, itemLimit, itemFont) {
+    if (!isMulti) {
+      const item = doc.items[0];
+      const lines = [
+        { kind: "text", text: `但し ${item.name} として`, size: 14, gapBefore: 0 },
+        { kind: "text", text: "上記正に領収いたしました", size: 13, gapBefore: 5 }
+      ];
+      doc.tax.forEach((entry) => {
+        lines.push({ kind: "text", text: taxLineText(entry), size: 10, color: RULE, gapBefore: 5 });
+      });
+      return lines;
+    }
+    const rows = collapseItems(doc.items, itemLimit);
+    const lines = [{ kind: "text", text: "但し 下記のとおり", size: 11, gapBefore: 0 }];
+    rows.forEach((row) => lines.push({ kind: "itemRow", row, size: itemFont, gapBefore: 1 }));
+    lines.push({ kind: "text", text: "上記正に領収いたしました", size: 11, gapBefore: 2 });
+    doc.tax.forEach((entry) => {
+      lines.push({ kind: "text", text: taxLineText(entry), size: 9, color: RULE, gapBefore: 2 });
+    });
+    return lines;
+  }
+
+  /** 行モデルの合計高さ(pt)。フォントの実測はせず lineHeight() の近似式だけで決まる。 */
+  function provisoHeight(lines) {
+    return lines.reduce((sum, l) => sum + l.gapBefore + lineHeight(l.size), 0);
+  }
+
+  /** 行モデルを実際に描画し、末尾のy座標を返す。 */
+  function drawProvisoModel(ctx, lines, left, startY) {
+    const detailWidth = 300;
+    let y = startY;
+    for (const l of lines) {
+      y += l.gapBefore;
+      if (l.kind === "text") {
+        drawText(ctx, l.text, left, y, l.size, { color: l.color });
+      } else {
+        const amountStr = yen(l.row.amount);
+        ctx.font = fontStr(l.size, false);
+        const amountW = ctx.measureText(amountStr).width;
+        const label = fitOneLine(ctx, l.row.name, l.size, detailWidth - 8 - amountW, false);
+        drawText(ctx, label, left, y, l.size, {});
+        drawText(ctx, amountStr, left + detailWidth, y, l.size, { align: "right" });
+      }
+      y += lineHeight(l.size);
+    }
+    return y;
+  }
+
+  /** 圧縮段階の一覧。先頭ほど非圧縮、末尾が最も詰めた状態。最初に収まった段階を採用する。 */
+  function compressionStages(isMulti) {
+    if (!isMulti) {
+      return [
+        { gapLevel: 0, itemLimit: 1, itemFont: 14 },
+        { gapLevel: 1, itemLimit: 1, itemFont: 14 },
+        { gapLevel: 2, itemLimit: 1, itemFont: 14 }
+      ];
+    }
+    return [
+      { gapLevel: 0, itemLimit: 5, itemFont: 10 },
+      { gapLevel: 1, itemLimit: 5, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 5, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 4, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 3, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 2, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 1, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 1, itemFont: 9 }
+    ];
+  }
+
+  function gapsForLevel(level, isMulti) {
+    const table = isMulti ? [[8, 6, 5], [5, 4, 3], [3, 2, 2]] : [[12, 10, 8], [8, 6, 5], [5, 4, 3]];
+    return table[Math.min(level, table.length - 1)];
+  }
+
   function drawReceipt(canvas, doc) {
     const ctx = canvas.getContext("2d");
     ctx.setTransform(3, 0, 0, 3, 0, 0);
@@ -418,7 +593,33 @@
     const right = PT_WIDTH - PAD_X;
     const contentWidth = right - left;
     const isMulti = doc.items.length > 1;
-    const gaps = isMulti ? [8, 6, 5] : [12, 10, 8];
+
+    // ---- footer(発行者ブロック + 朱印)を先に確保する。フレーム下端に固定し、
+    //      本文がどれだけ伸びても footer 側には一切譲らない(v8-1)。
+    const footerLinesArr = footerLines(ctx, doc.issuer);
+    const footerH = footerHeight(footerLinesArr);
+    const footerBottom = PT_HEIGHT - PAD_Y;
+    const footerTop = footerBottom - footerH;
+
+    // 本文側の固定高さ(見出し・宛先行・金額枠は文言に関わらず高さが変わらない)
+    const headerH = Math.max(lineHeight(30) + 3 + 1.5, lineHeight(11) * 2 + 4);
+    const payeeRowH = Math.max(lineHeight(19) + 3 + 1, lineHeight(15) + 3);
+    const boxPadV = 8;
+    const amountBoxH = Math.max(lineHeight(13), lineHeight(30)) + boxPadV * 2;
+
+    // 本文が footerTop に収まる圧縮段階を探す。見つからなければ最も詰めた段階を使う(はみ出しは残るが最小化)。
+    const stages = compressionStages(isMulti);
+    let gaps = gapsForLevel(stages[stages.length - 1].gapLevel, isMulti);
+    let provisoModel = buildProvisoModel(doc, isMulti, stages[stages.length - 1].itemLimit, stages[stages.length - 1].itemFont);
+    for (const stage of stages) {
+      const candidateGaps = gapsForLevel(stage.gapLevel, isMulti);
+      const candidateModel = buildProvisoModel(doc, isMulti, stage.itemLimit, stage.itemFont);
+      const bodyTop = PAD_Y + headerH + candidateGaps[0] + payeeRowH + candidateGaps[1] + amountBoxH + candidateGaps[2];
+      const bodyBottom = bodyTop + provisoHeight(candidateModel);
+      gaps = candidateGaps;
+      provisoModel = candidateModel;
+      if (bodyBottom <= footerTop) break;
+    }
 
     let y = PAD_Y;
 
@@ -432,7 +633,6 @@
     if (dateText) {
       drawText(ctx, dateText, right, y + lineHeight(11) + 4, 11, { align: "right", color: RULE });
     }
-    const headerH = Math.max(lineHeight(30) + 3 + 1.5, lineHeight(11) * 2 + 4);
     y += headerH + gaps[0];
 
     // ---- payeeRow ----
@@ -442,7 +642,6 @@
     drawText(ctx, fittedPayee, left, y, 19, {});
     ctx.fillStyle = INK;
     ctx.fillRect(left, y + lineHeight(19) + 3, payeeBoxWidth, 1);
-    const payeeRowH = Math.max(lineHeight(19) + 3 + 1, lineHeight(15) + 3);
     if (showSamaSuffix(doc.payee)) {
       const samaY = y + payeeRowH - 3 - lineHeight(15);
       drawText(ctx, "様", left + payeeBoxWidth + 6, samaY, 15, {});
@@ -450,10 +649,7 @@
     y += payeeRowH + gaps[1];
 
     // ---- amountBox ----
-    const boxPadV = 8;
     const boxPadH = 16;
-    const amountContentH = Math.max(lineHeight(13), lineHeight(30));
-    const amountBoxH = amountContentH + boxPadV * 2;
     ctx.strokeStyle = INK;
     ctx.lineWidth = 1.2;
     drawRoundRect(ctx, left, y, contentWidth, amountBoxH, 3);
@@ -470,48 +666,10 @@
     drawShrinkableText(ctx, amountText, amountX, contentY, 30, amountMaxWidth, { bold: true });
     y += amountBoxH + gaps[2];
 
-    // ---- provisoBlock ----
-    if (!isMulti) {
-      const item = doc.items[0];
-      drawText(ctx, `但し ${item.name} として`, left, y, 14, {});
-      y += lineHeight(14) + 5;
-      drawText(ctx, "上記正に領収いたしました", left, y, 13, {});
-      y += lineHeight(13);
-      for (const entry of doc.tax) {
-        y += 5;
-        drawText(ctx, taxLineText(entry), left, y, 10, { color: RULE });
-        y += lineHeight(10);
-      }
-    } else {
-      drawText(ctx, "但し 下記のとおり", left, y, 11, {});
-      y += lineHeight(11) + 1;
-      const detailWidth = 300;
-      doc.items.forEach((item, idx) => {
-        const amountStr = yen(item.amount);
-        ctx.font = fontStr(10, false);
-        const amountW = ctx.measureText(amountStr).width;
-        const label = fitOneLine(ctx, itemLineLabel(item), 10, detailWidth - 8 - amountW, false);
-        drawText(ctx, label, left, y, 10, {});
-        drawText(ctx, amountStr, left + detailWidth, y, 10, { align: "right" });
-        y += lineHeight(10);
-        if (idx < doc.items.length - 1) y += 1;
-      });
-      y += 2;
-      drawText(ctx, "上記正に領収いたしました", left, y, 11, {});
-      y += lineHeight(11);
-      for (const entry of doc.tax) {
-        y += 2;
-        drawText(ctx, taxLineText(entry), left, y, 9, { color: RULE });
-        y += lineHeight(9);
-      }
-    }
+    // ---- provisoBlock(圧縮済みモデルを描画) ----
+    drawProvisoModel(ctx, provisoModel, left, y);
 
-    // ---- footer(発行者ブロック + 朱印。フレーム下端に揃える) ----
-    const lines = footerLines(ctx, doc.issuer);
-    const footerH = footerHeight(lines);
-    const footerBottom = PT_HEIGHT - PAD_Y;
-    const footerTop = Math.max(y, footerBottom - footerH);
-
+    // ---- footer(発行者ブロック + 朱印。フレーム下端に固定) ----
     const sealSize = 58;
     const sealCx = right - sealSize / 2;
     const sealCy = footerTop + Math.max(footerH, sealSize) / 2;
@@ -519,9 +677,9 @@
 
     const issuerRight = right - sealSize - 12;
     const issuerLeft = issuerRight - 220;
-    const issuerTextH = lines.reduce((sum, l) => sum + lineHeight(l.size), 0) + 2 * Math.max(0, lines.length - 1);
+    const issuerTextH = footerLinesArr.reduce((sum, l) => sum + lineHeight(l.size), 0) + 2 * Math.max(0, footerLinesArr.length - 1);
     let ly = footerTop + Math.max(0, (footerH - issuerTextH));
-    for (const l of lines) {
+    for (const l of footerLinesArr) {
       drawText(ctx, l.text, issuerLeft, ly, l.size, { bold: !!l.bold, color: l.color });
       ly += lineHeight(l.size) + 2;
     }
@@ -564,20 +722,25 @@
       return;
     }
 
-    let raw;
+    // v8-9: フラグメントは客のURL由来で改変できる不信な入力。デコードも正規化(型・件数・
+    // 文字列長・合計の整合性)も同じ try の内側で行い、どこで転んでも例外を投げっぱなしにせず
+    // エラー表示へ落とす(以前は normalizePayload が try の外にあり、型不一致があると
+    // 例外が拾われず「読み込んでいます…」のまま止まっていた)。
+    let doc;
     try {
-      raw = await decodeFragment(fragment);
+      const raw = await decodeFragment(fragment);
+      doc = normalizePayload(raw);
     } catch (e) {
-      showError(
-        "領収書のデータが読み取れません",
-        "このブラウザは圧縮データの展開に対応していません。別のブラウザ(Chrome / Safari 最新版)でお試しください。"
-      );
-      return;
-    }
-
-    const doc = normalizePayload(raw);
-    if (!doc) {
-      showError("領収書のデータが読み取れません", "発行元からもう一度QRコードを見せてもらってください。");
+      if (e instanceof PayloadValidationError && e.reason === "sum-mismatch") {
+        showError("領収書のデータが壊れています", "発行元からもう一度QRコードを見せてもらってください。");
+      } else if (e instanceof PayloadValidationError) {
+        showError("領収書のデータが読み取れません", "発行元からもう一度QRコードを見せてもらってください。");
+      } else {
+        showError(
+          "領収書のデータが読み取れません",
+          "このブラウザは圧縮データの展開に対応していません。別のブラウザ(Chrome / Safari 最新版)でお試しください。"
+        );
+      }
       return;
     }
 
